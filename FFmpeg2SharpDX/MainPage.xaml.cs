@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices.WindowsRuntime;
+using System.Threading.Tasks;
 using Windows.Foundation;
 using Windows.Foundation.Collections;
 using Windows.UI.Xaml;
@@ -23,22 +24,39 @@ namespace FFmpeg2SharpDX
     public sealed partial class MainPage : Page
     {
         private StreamService _streamService;
+        private bool _isRendering;
 
         public MainPage()
         {
             this.InitializeComponent();
-            _streamService = new StreamService(dxSurface);
+            _streamService = new StreamService(SwapChainPanel);
         }
 
         // Button events
         private void StartStream_Btn_Click(object sender, RoutedEventArgs e)
         {
             _streamService.StartStream();
+            _isRendering = true;
         }
 
         private void StopStream_Btn_Click(object sender, RoutedEventArgs e)
         {
             _streamService.StopStream();
+            _isRendering = false;
+        }
+
+        private async void RenderLoop()
+        {
+            while (_isRendering)
+            {
+                _streamService.RenderFrame();
+                await Task.Delay(16); // Approximately 60 FPS
+            }
+        }
+
+        private void Render_Btn_OnClick(object sender, RoutedEventArgs e)
+        {
+            RenderLoop();
         }
     }
 }

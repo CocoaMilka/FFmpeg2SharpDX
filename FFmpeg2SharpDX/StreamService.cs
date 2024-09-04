@@ -6,6 +6,8 @@ using FFmpegInteropX;
 using SharpDX;
 using SharpDX.DXGI;
 using SharpDX.Direct3D11;
+using Device = SharpDX.Direct3D11.Device;
+
 using Windows.UI.Xaml.Controls;
 using SharpDX.Direct3D;
 
@@ -14,18 +16,31 @@ using Windows.Graphics.DirectX.Direct3D11;
 using Windows.Graphics.Imaging;
 using Windows.Media.Playback;
 using System.Diagnostics;
-using Windows.UI.Xaml.Media.Imaging;
+
+using Microsoft.UI.Xaml;
+using SharpDX.Mathematics.Interop;
+using System.Threading.Tasks;
 
 namespace FFmpeg2SharpDX
 {
+    [ComImport, Guid("790a45f7-0d42-4876-983a-0a55cfe6f4aa"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface ISwapChainPanelNative
+    {
+        void SetSwapChain(IntPtr swapChainPointer);
+    }
+
+
     public class StreamService
     {
         private SwapChainPanel _swapChainPanel;
         private SharpDX.Direct3D11.Device device;
         private SharpDX.Direct3D11.DeviceContext deviceContext;
         private SwapChain swapChain;
+        private IDirect3DSurface surface;
+
         private RenderTargetView renderTargetView;
         private Texture2D renderTargetTexture;
+        private Texture2D backBuffer;
 
         // Media player members
         private MediaPlayer mediaPlayer;
@@ -38,69 +53,92 @@ namespace FFmpeg2SharpDX
         public StreamService(SwapChainPanel swapChainPanel)
         {
             _swapChainPanel = swapChainPanel;
-            InitializeSwapChain();
-            InitializeMediaPlayer();
-            CreateRenderTarget();
+
+            swapChainPanel.Loaded += (sender, args) =>
+            {
+                // Only create the swap chain after the SwapChainPanel is loaded
+                InitializeSwapChain();
+                InitializeMediaPlayer();
+            };
         }
 
         private void InitializeSwapChain()
         {
-            // Create device and context
-            device = new SharpDX.Direct3D11.Device(DriverType.Hardware, DeviceCreationFlags.BgraSupport);
-            deviceContext = device.ImmediateContext;
+            // Create Direct3D device and context
+            var creationFlags = DeviceCreationFlags.BgraSupport;
+            creationFlags |= DeviceCreationFlags.Debug;
+            device = new Device(SharpDX.Direct3D.DriverType.Hardware, creationFlags);
 
-            // Get the DPI of the display
-            float dpi = DisplayInformation.GetForCurrentView().LogicalDpi;
+            // Verify valid dimensions
+            var width = (int)_swapChainPanel.ActualWidth;
+            var height = (int)_swapChainPanel.ActualHeight;
 
-            // Calculate the swap chain panel dimensions
-            int panelWidth = (int)(_swapChainPanel.ActualWidth * dpi / 96.0f);
-            int panelHeight = (int)(_swapChainPanel.ActualHeight * dpi / 96.0f);
-
-            // Initialize the swap chain description
-            var swapChainDescription = new SwapChainDescription1
+            if (width <= 0 || height <= 0)
             {
-                Width = panelWidth,
-                Height = panelHeight,
+                throw new InvalidOperationException("SwapChainPanel size is invalid.");
+            }
+
+            if (_swapChainPanel == null)
+            {
+                throw new InvalidOperationException("SwapChainPanel is not initialized.");
+            }
+
+            // Descriptions
+            SwapChainDescription1 swapChainDesc = new SwapChainDescription1()
+            {
+                Width = (int)_swapChainPanel.ActualWidth,
+                Height = (int)_swapChainPanel.ActualHeight,
                 Format = Format.B8G8R8A8_UNorm,
                 Stereo = false,
                 SampleDescription = new SampleDescription(1, 0),
+                Usage = Usage.BackBuffer | Usage.RenderTargetOutput,
                 BufferCount = 2,
-                SwapEffect = SwapEffect.FlipSequential,
+                SwapEffect = SwapEffect.FlipDiscard,
                 Scaling = Scaling.Stretch,
-                AlphaMode = AlphaMode.Ignore
+                AlphaMode = AlphaMode.Premultiplied,
+                Flags = SwapChainFlags.AllowModeSwitch | SwapChainFlags.AllowTearing
             };
 
-            // Get the DXGI factory
+            var textureDesc = new Texture2DDescription
+            {
+                Width = width,
+                Height = height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default,
+                BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+                CpuAccessFlags = CpuAccessFlags.None,
+                OptionFlags = ResourceOptionFlags.None,
+            };
+
             using (var dxgiDevice = device.QueryInterface<SharpDX.DXGI.Device>())
             {
-                using (var dxgiAdapter = dxgiDevice.Adapter)
+                using (var adapter = dxgiDevice.Adapter)
                 {
-                    using (var dxgiFactory = dxgiAdapter.GetParent<Factory2>())
+                    using (var factory = adapter.GetParent<Factory2>())
                     {
-                        // Create the swap chain
-                        swapChain = new SwapChain1(dxgiFactory, device, ref swapChainDescription);
+                        using (swapChain = new SwapChain1(factory, dxgiDevice, ref swapChainDesc))
+                        {
+                            var swapChainPanel = this._swapChainPanel;
+                            var swapChainPanelNative = ComObject.As<SharpDX.DXGI.ISwapChainPanelNative>(swapChainPanel);
+                            swapChainPanelNative.SwapChain = swapChain;
+
+                            // Set render view
+                            backBuffer = swapChain.GetBackBuffer<Texture2D>(0);
+                            renderTargetView = new RenderTargetView(device, backBuffer);
+                            device.ImmediateContext.OutputMerger.SetRenderTargets(renderTargetView);
+
+                            // Set render target texture
+                            renderTargetTexture = new Texture2D(device, textureDesc);
+                            direct3DSurface = Direct3D11Helper.CreateDirect3DSurfaceFromSharpDXTexture(renderTargetTexture);
+
+                            backBuffer.Dispose();
+                        }
                     }
                 }
             }
-
-            // Associate swap chain with the SwapChainPanel
-            using (var nativePanel = ComObject.As<SharpDX.DXGI.ISwapChainPanelNative>(_swapChainPanel))
-            {
-                nativePanel.SwapChain = swapChain;
-            }
-
-            // Create render target view
-            using (var backBuffer = swapChain.GetBackBuffer<Texture2D>(0))
-            {
-                renderTargetView = new RenderTargetView(device, backBuffer);
-            }
-
-            deviceContext.OutputMerger.SetRenderTargets(renderTargetView);
-
-            // Bind the render target view to the pipeline
-            deviceContext.OutputMerger.SetRenderTargets(renderTargetView);
-
-            System.Diagnostics.Debug.WriteLine("SwapChain initialized!");
         }
 
         private async void InitializeMediaPlayer()
@@ -131,6 +169,7 @@ namespace FFmpeg2SharpDX
 
                 // Create MediaPlaybackItem from FFmpegMediaSource
                 mediaPlaybackItem = ffmpegMediaSource.CreateMediaPlaybackItem();
+                if (mediaPlaybackItem == null) { throw new Exception("Failed to create MediaPlaybackItem."); }
 
                 mediaPlayer = new MediaPlayer
                 {
@@ -150,7 +189,12 @@ namespace FFmpeg2SharpDX
         {
             try
             {
-                //mediaPlayer.CopyFrameToVideoSurface(renderTargetTexture);
+                sender.CopyFrameToVideoSurface(direct3DSurface);
+                // Create a Bitmap from the Direct3D surface
+                var frameBitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(direct3DSurface);
+
+                // Save the bitmap to a file for debug
+                //await SaveSoftwareBitmapToFileAsync(frameBitmap, "frame.png");
 
                 System.Diagnostics.Debug.WriteLine("Frame Available");
             }
@@ -160,22 +204,59 @@ namespace FFmpeg2SharpDX
             }
         }
 
-        private void CreateRenderTarget()
+        public void RenderFrame()
         {
-            // Create a texture that matches the video frame size
-            renderTargetTexture = new Texture2D(device, new Texture2DDescription
+            if (swapChain == null || renderTargetView == null || renderTargetTexture == null)
             {
-                Width = (int)_swapChainPanel.ActualWidth,
-                Height = (int)_swapChainPanel.ActualHeight,
-                MipLevels = 1,
-                ArraySize = 1,
-                Format = Format.B8G8R8A8_UNorm,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
-                CpuAccessFlags = CpuAccessFlags.None,
-                OptionFlags = ResourceOptionFlags.None,
-            });
+                System.Diagnostics.Debug.WriteLine("SwapChain, RenderTargetView, or RenderTargetTexture is not initialized.");
+                return;
+            }
+
+            try
+            {
+
+                // Clear the render target
+                device.ImmediateContext.ClearRenderTargetView(renderTargetView, new RawColor4(1, 1, 1, 1));
+
+                // Set the render target
+                device.ImmediateContext.OutputMerger.SetRenderTargets(renderTargetView);
+
+                // Bind the texture that was updated by MediaPlayer to the pixel shader
+                using (var shaderResourceView = new ShaderResourceView(device, renderTargetTexture))
+                {
+                    device.ImmediateContext.PixelShader.SetShaderResource(0, shaderResourceView);
+
+                    // Render the quad or whatever geometry is required
+                    device.ImmediateContext.Draw(6, 0); // Assuming full-screen quad
+                }
+
+                // Present the frame
+                swapChain.Present(1, PresentFlags.None);
+                System.Diagnostics.Debug.WriteLine("Frame presented successfully.");
+            }
+            catch (SharpDXException ex) when (ex.ResultCode == SharpDX.DXGI.ResultCode.DeviceRemoved || ex.ResultCode == SharpDX.DXGI.ResultCode.DeviceReset)
+            {
+                System.Diagnostics.Debug.WriteLine("Device removed or reset, reinitializing...");
+
+                // Handle device removal by reinitializing the device and related resources
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Exception during RenderFrame: {ex.Message}");
+            }
+        }
+
+        private async Task SaveSoftwareBitmapToFileAsync(SoftwareBitmap softwareBitmap, string fileName)
+        {
+            var file = await Windows.Storage.KnownFolders.PicturesLibrary.CreateFileAsync(fileName, Windows.Storage.CreationCollisionOption.GenerateUniqueName);
+
+            using (var stream = await file.OpenAsync(Windows.Storage.FileAccessMode.ReadWrite))
+            {
+                var encoder = await Windows.Graphics.Imaging.BitmapEncoder.CreateAsync(Windows.Graphics.Imaging.BitmapEncoder.PngEncoderId, stream);
+
+                encoder.SetSoftwareBitmap(softwareBitmap);
+                await encoder.FlushAsync();
+            }
         }
 
         public void StartStream()
