@@ -93,7 +93,7 @@ namespace FFmpeg2SharpDX
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = Usage.BackBuffer | Usage.RenderTargetOutput,
                 BufferCount = 2,
-                SwapEffect = SwapEffect.FlipDiscard,
+                SwapEffect = SwapEffect.FlipSequential,
                 Scaling = Scaling.Stretch,
                 AlphaMode = AlphaMode.Premultiplied,
                 Flags = SwapChainFlags.AllowModeSwitch | SwapChainFlags.AllowTearing
@@ -119,26 +119,42 @@ namespace FFmpeg2SharpDX
                 {
                     using (var factory = adapter.GetParent<Factory2>())
                     {
-                        using (swapChain = new SwapChain1(factory, dxgiDevice, ref swapChainDesc))
+                        // Create the swap chain
+                        swapChain = new SwapChain1(factory, dxgiDevice, ref swapChainDesc);
+
+                        // Link swap chain to the SwapChainPanel (if using UWP/XAML)
+                        var swapChainPanel = this._swapChainPanel;
+                        var swapChainPanelNative = ComObject.As<SharpDX.DXGI.ISwapChainPanelNative>(swapChainPanel);
+                        swapChainPanelNative.SwapChain = swapChain;
+
+                        // Get the back buffer from the swap chain
+                        backBuffer = swapChain.GetBackBuffer<Texture2D>(0);
+
+                        // Create the render target view for the back buffer
+                        renderTargetView = new RenderTargetView(device, backBuffer);
+
+                        // Set the back buffer as the render target for the output merger stage
+                        device.ImmediateContext.OutputMerger.SetRenderTargets(renderTargetView);
+
+                        // Create a Direct3DSurface from the back buffer
+                        direct3DSurface = Direct3D11Helper.CreateDirect3DSurfaceFromSharpDXTexture(backBuffer);
+
+                        // Set the viewport for the rendering area
+                        var viewport = new SharpDX.Mathematics.Interop.RawViewportF
                         {
-                            var swapChainPanel = this._swapChainPanel;
-                            var swapChainPanelNative = ComObject.As<SharpDX.DXGI.ISwapChainPanelNative>(swapChainPanel);
-                            swapChainPanelNative.SwapChain = swapChain;
+                            Width = swapChainDesc.Width,
+                            Height = swapChainDesc.Height,
+                            MinDepth = 0.0f,
+                            MaxDepth = 1.0f
+                        };
+                        device.ImmediateContext.Rasterizer.SetViewport(viewport);
 
-                            // Set render view
-                            backBuffer = swapChain.GetBackBuffer<Texture2D>(0);
-                            renderTargetView = new RenderTargetView(device, backBuffer);
-                            device.ImmediateContext.OutputMerger.SetRenderTargets(renderTargetView);
-
-                            // Set render target texture
-                            renderTargetTexture = new Texture2D(device, textureDesc);
-                            direct3DSurface = Direct3D11Helper.CreateDirect3DSurfaceFromSharpDXTexture(renderTargetTexture);
-
-                            backBuffer.Dispose();
-                        }
+                        // Now direct3DSurface is tied to the back buffer
+                        // FFmpegInteropX or other sources can render to the swap chain's back buffer via this surface
                     }
                 }
             }
+
         }
 
         private async void InitializeMediaPlayer()
@@ -189,12 +205,19 @@ namespace FFmpeg2SharpDX
         {
             try
             {
+                var clearColor = new SharpDX.Mathematics.Interop.RawColor4(0.1f, 0.0f, 0.2f, 1.0f);
+                device.ImmediateContext.ClearRenderTargetView(renderTargetView, clearColor);
+
+
                 sender.CopyFrameToVideoSurface(direct3DSurface);
+
                 // Create a Bitmap from the Direct3D surface
-                var frameBitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(direct3DSurface);
+                //var frameBitmap = await SoftwareBitmap.CreateCopyFromSurfaceAsync(direct3DSurface);
 
                 // Save the bitmap to a file for debug
                 //await SaveSoftwareBitmapToFileAsync(frameBitmap, "frame.png");
+
+                swapChain.Present(1, PresentFlags.None);
 
                 System.Diagnostics.Debug.WriteLine("Frame Available");
             }
@@ -230,6 +253,7 @@ namespace FFmpeg2SharpDX
                     device.ImmediateContext.Draw(6, 0); // Assuming full-screen quad
                 }
 
+
                 // Present the frame
                 swapChain.Present(1, PresentFlags.None);
                 System.Diagnostics.Debug.WriteLine("Frame presented successfully.");
@@ -239,6 +263,7 @@ namespace FFmpeg2SharpDX
                 System.Diagnostics.Debug.WriteLine("Device removed or reset, reinitializing...");
 
                 // Handle device removal by reinitializing the device and related resources
+                InitializeSwapChain();
             }
             catch (Exception ex)
             {
